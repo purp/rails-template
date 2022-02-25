@@ -1,7 +1,9 @@
 version: 2.1
 
 orbs:
-  browser-tools: circleci/browser-tools@1.1.0
+  browser-tools: circleci/browser-tools@1.2.2
+  node: circleci/node@4.7.0
+  ruby: circleci/ruby@1.1.4
 
 executors:
   ruby:
@@ -12,93 +14,74 @@ executors:
           PGUSER: postgres
           PGPASS: postgres
           RAILS_ENV: test
-          HEADLESS_CHROME: "1"
       - image: circleci/postgres:13-ram
         environment:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
 
 commands:
-  bundle_install:
-    description: Install Ruby dependencies with Bundler
+  install_node_dependencies:
     steps:
-      - restore_cache:
-          keys:
-            - bundle-v1-{{ arch }}-{{ checksum ".ruby-version" }}-{{ checksum "Gemfile.lock" }}
-            - bundle-v1-{{ arch }}-{{ checksum ".ruby-version" }}-
-      - run:
-          name: Install Ruby Dependencies
-          command: |
-            gem install bundler -v <%=  Bundler::VERSION %> --conservative --no-document
-            bundle config --local deployment true
-            bundle config --local path vendor/bundle
-            bundle config --local without development:production
-            bundle check || (bundle install --jobs=4 --retry=3 && bundle clean)
-      - save_cache:
-          paths:
-            - ./vendor/bundle
-          key: bundle-v1-{{ arch }}-{{ checksum ".ruby-version" }}-{{ checksum "Gemfile.lock" }}
+      - node/install:
+          install-yarn: true
+          install-npm: false
+          lts: true
+      - node/install-packages:
+          pkg-manager: yarn
   set_up_database:
     steps:
       - run:
           name: Set Up Database
-          command: |
-            cp example.env .env
-            bundle exec rake db:setup
-  yarn_install:
-    description: Install JS dependencies with Yarn
-    steps:
-      - restore_cache:
-          keys:
-            - yarn-cache-v1-{{ arch }}-{{ checksum "yarn.lock" }}
-            - yarn-cache-v1-{{ arch }}
-      - run:
-          name: Install JS Dependencies
-          command: yarn install --frozen-lockfile --cache-folder .yarn-cache
-      - save_cache:
-          paths:
-            - .yarn-cache
-          key: yarn-cache-v1-{{ arch }}-{{ checksum "yarn.lock" }}
+          command: bundle exec rake db:setup
 
 jobs:
   static_analysis:
     executor: ruby
     steps:
       - checkout
-      - bundle_install
-      - yarn_install
+      - ruby/install-deps
+      - install_node_dependencies
       - run:
           name: Run Overcommit
           command: |
-            gem install overcommit
+            gem install overcommit --no-document
             git config --local user.name "Circle CI"
             git config --local user.email ci@example.com
             overcommit --sign
             overcommit --run
+
+  security_audits:
+    executor: ruby
+    steps:
+      - checkout
+      - ruby/install-deps
       - run:
-          name: Run Security Audits
-          command: |
-            bundle exec brakeman -q --no-summary
-            bundle exec bundle-audit check --update -v
+          name: Brakeman
+          command: bundle exec brakeman --exit-on-warn --no-progress --color --output /dev/stdout
+      - run:
+          name: Bundle Audit
+          command: bundle exec bundle-audit check --update -v
+
   test:
     executor: ruby
     steps:
       - checkout
-      - bundle_install
-      - yarn_install
+      - ruby/install-deps
+      - install_node_dependencies
       - set_up_database
       - run:
           name: Run Tests
           command: bundle exec rake test TESTOPTS="--ci-dir=./reports"
       - store_test_results:
           path: ./reports
+
   test_system:
     executor: ruby
     steps:
       - browser-tools/install-chrome
       - checkout
-      - bundle_install
-      - yarn_install
+      - ruby/install-deps
+      - install_node_dependencies
       - set_up_database
       - run:
           name: Run System Tests
@@ -116,17 +99,6 @@ workflows:
   commit-workflow:
     jobs:
       - static_analysis
-      - test
-      - test_system
-  cron-workflow:
-    triggers:
-      - schedule:
-          cron: "0 13 * * 1,2,3,4,5"
-          filters:
-            branches:
-              only:
-                - main
-    jobs:
-      - static_analysis
+      - security_audits
       - test
       - test_system

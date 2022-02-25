@@ -1,6 +1,6 @@
 require "bundler"
 require "json"
-RAILS_REQUIREMENT = "~> 6.1.0".freeze
+RAILS_REQUIREMENT = "~> 7.0.0".freeze
 
 def apply_template!
   assert_minimum_rails_version
@@ -8,12 +8,12 @@ def apply_template!
   assert_postgresql
   add_template_repository_to_source_path
 
-  # We're going to handle bundler and webpacker ourselves.
-  # Setting these options will prevent Rails from running them unnecessarily.
-  self.options = options.merge(
-    skip_bundle: true,
-    skip_webpack_install: true
-  )
+  if install_vite?
+    self.options = options.merge(
+      css: nil,
+      skip_asset_pipeline: true
+    )
+  end
 
   template "Gemfile.tt", force: true
 
@@ -22,15 +22,14 @@ def apply_template!
 
   template "example.env.tt"
   copy_file "editorconfig", ".editorconfig"
-  copy_file "gitignore", ".gitignore", force: true
   copy_file "overcommit.yml", ".overcommit.yml"
   template "ruby-version.tt", ".ruby-version", force: true
 
   copy_file "Procfile"
+  copy_file "package.json"
 
   apply "Rakefile.rb"
   apply "config.ru.rb"
-  apply "app/template.rb"
   apply "bin/template.rb"
   apply "circleci/template.rb"
   apply "config/template.rb"
@@ -40,31 +39,52 @@ def apply_template!
   git :init unless preexisting_git_repo?
   empty_directory ".git/safe"
 
-  run_with_clean_bundler_env "bundle update"
-  run_with_clean_bundler_env "bin/rails webpacker:install"
-  install_dart_sass unless sprockets?
-  create_database_and_initial_migration
-  run_with_clean_bundler_env "bin/setup"
+  after_bundle do
+    append_to_file ".gitignore", <<~IGNORE
 
-  binstubs = %w[brakeman bundler bundler-audit rubocop sidekiq]
-  run_with_clean_bundler_env "bundle binstubs #{binstubs.join(' ')} --force"
+      # Ignore application config.
+      /.env.development
+      /.env.*local
+    IGNORE
 
-  template "rubocop.yml.tt", ".rubocop.yml"
-  run_rubocop_autocorrections
+    if install_vite?
+      File.rename("app/javascript", "app/frontend") if File.exist?("app/javascript")
+      run_with_clean_bundler_env "bundle exec vite install"
+      run "yarn add sass @picocss/pico"
+      apply "app/frontend/template.rb"
+    end
 
-  template "eslintrc.js", ".eslintrc.js"
-  template "prettierrc.js", ".prettierrc.js"
-  template "stylelintrc.js", ".stylelintrc.js"
-  add_yarn_lint_and_run_fix
-  add_yarn_start_script
+    apply "app/template.rb"
 
-  unless any_local_git_commits?
-    git checkout: "-b main"
-    git add: "-A ."
-    git commit: "-n -m 'Set up project'"
-    if git_repo_specified?
-      git remote: "add origin #{git_repo_url.shellescape}"
-      git push: "-u origin --all"
+    create_database_and_initial_migration
+    run_with_clean_bundler_env "bin/setup"
+
+    binstubs = %w[brakeman bundler bundler-audit rubocop sidekiq]
+    run_with_clean_bundler_env "bundle binstubs #{binstubs.join(' ')} --force"
+
+    remove_file "Procfile.dev" unless File.exist?("bin/dev")
+
+    template "rubocop.yml.tt", ".rubocop.yml"
+    run_rubocop_autocorrections
+
+    template "eslintrc.js", ".eslintrc.js"
+    template "prettierrc.js", ".prettierrc.js"
+    template "stylelintrc.js", ".stylelintrc.js"
+    add_yarn_lint_and_run_fix
+    add_yarn_start_script
+
+    append_to_file ".gitignore", "node_modules" unless File.read(".gitignore").match?(%{^/?node_modules})
+
+    run_with_clean_bundler_env "bundle lock --add-platform x86_64-linux"
+
+    unless any_local_git_commits?
+      git checkout: "-b main"
+      git add: "-A ."
+      git commit: "-n -m 'Set up project'"
+      if git_repo_specified?
+        git remote: "add origin #{git_repo_url.shellescape}"
+        git push: "-u origin --all"
+      end
     end
   end
 end
@@ -140,10 +160,15 @@ def production_hostname
     ask_with_default("Production hostname?", :blue, "example.com")
 end
 
-def gemfile_requirement(name)
+def gemfile_entry(name, version=nil, require: true, force: false)
   @original_gemfile ||= IO.read("Gemfile")
-  req = @original_gemfile[/gem\s+['"]#{name}['"]\s*(,[><~= \t\d\.\w'"]*)?.*$/, 1]
-  req && req.gsub("'", %(")).strip.sub(/^,\s*"/, ', "')
+  entry = @original_gemfile[/^\s*gem #{Regexp.quote(name.inspect)}.*$/]
+  return if entry.nil? && !force
+
+  require = (entry && entry[/\brequire:\s*([\S]+)/, 1]) || require
+  version = (entry && entry[/, "([^"]+)"/, 1]) || version
+  args = [name.inspect, version&.inspect, ("require: false" if require != true)].compact
+  "gem #{args.join(", ")}\n"
 end
 
 def ask_with_default(question, color, default)
@@ -193,19 +218,24 @@ def create_database_and_initial_migration
 end
 
 def add_yarn_start_script
+  return add_package_json_script(start: "bin/dev") if File.exist?("bin/dev")
+
   run_with_clean_bundler_env "yarn add --dev concurrently"
-  add_package_json_script(
-    start: "concurrently --raw --kill-others-on-fail 'bin/rails s -b 0.0.0.0' 'bin/webpack-dev-server' 'bin/sidekiq'"
-  )
+
+  procs = ["'bin/rails s -b 0.0.0.0'"]
+  procs << "'bin/vite dev'" if File.exist?("bin/vite")
+  procs << "bin/webpack-dev-server" if File.exist?("bin/webpack-dev-server")
+
+  add_package_json_script(start: "concurrently --raw --kill-others-on-fail #{procs.join(" ")}")
 end
 
 def add_yarn_lint_and_run_fix
   packages = %w[
-    babel-eslint
     eslint
     eslint-config-prettier
-    eslint-plugin-prettier prettier
+    eslint-plugin-prettier
     npm-run-all
+    prettier
     stylelint
     stylelint-config-recommended-scss
     stylelint-config-standard
@@ -214,38 +244,19 @@ def add_yarn_lint_and_run_fix
   ]
   run_with_clean_bundler_env "yarn add #{packages.join(' ')} -D"
   add_package_json_script("lint": "npm-run-all -c lint:*")
-  add_package_json_script("lint:js": "eslint 'app/{assets,components,javascript}/**/*.{js,jsx}'")
-  add_package_json_script("lint:css": "stylelint 'app/{assets,components,javascript}/**/*.{css,scss}'")
+  add_package_json_script("lint:js": "eslint 'app/{components,frontend,javascript}/**/*.{js,jsx}'")
+  add_package_json_script("lint:css": "stylelint 'app/{components,frontend,assets/stylesheets}/**/*.{css,scss}'")
   run_with_clean_bundler_env "yarn lint:js --fix"
   run_with_clean_bundler_env "yarn lint:css --fix"
 end
 
 def add_package_json_script(scripts)
-  package_json = JSON.parse(IO.read("package.json"))
-  package_json["scripts"] ||= {}
   scripts.each do |name, script|
-    package_json["scripts"][name.to_s] = script
+    run ["npm", "set-script", name.to_s.shellescape, script.shellescape].join(" ")
   end
-  package_json = {
-    "name" => package_json["name"],
-    "scripts" => package_json["scripts"].sort.to_h
-  }.merge(package_json)
-  IO.write("package.json", JSON.pretty_generate(package_json) + "\n")
 end
 
-def install_dart_sass
-  run_with_clean_bundler_env "yarn add -D sass" unless sprockets?
-  insert_into_file "config/webpack/environment.js", <<~JAVASCRIPT, before: /^module\.exports/
-    const sassLoader = environment.loaders
-      .get("sass")
-      .use.find((el) => el.loader === "sass-loader");
-    sassLoader.options.implementation = require("sass");
-
-  JAVASCRIPT
+def install_vite?
+  options[:javascript] == "vite"
 end
-
-def sprockets?
-  ! options[:skip_sprockets]
-end
-
 apply_template!

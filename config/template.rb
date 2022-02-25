@@ -15,8 +15,6 @@ gsub_file "config/routes.rb", /  # root 'welcome#index'/ do
   '  root "home#index"'
 end
 
-insert_into_file "config/spring.rb", "Spring.quiet = true\n", before: /^Spring\.watch/
-
 gsub_file "config/routes.rb", /  # root 'welcome#index'/ do
   '  root "home#index"'
 end
@@ -35,4 +33,4 @@ apply "config/environments/production.rb"
 apply "config/environments/test.rb"
 
 route 'root "home#index"'
-route %Q(mount Sidekiq::Web => "/sidekiq" # monitoring console\n)
+route %Q(mount Sidekiq::Web => "/sidekiq" if defined?(Sidekiq) # monitoring console\n)
